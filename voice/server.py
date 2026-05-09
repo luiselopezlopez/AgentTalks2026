@@ -1,27 +1,28 @@
 """
-Course Atlas Voice Server
+General Voice Companion Server
 WebSocket bridge between Azure VoiceLive and the React frontend.
-
-Filter updates use function calling (set_filters tool) — the AI silently calls
-the function whenever it wants to update the catalog view. Arguments are
-forwarded to the browser as real-time filter WebSocket messages.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import difflib
+import html
 import json
 import logging
 import os
 import queue
 import re
+import socket
 import sys
 import time
 from datetime import datetime
-from pathlib import Path
+from html.parser import HTMLParser
+from ipaddress import ip_address, ip_network
 from typing import Optional, Union
+from urllib.parse import quote_plus, urlparse
 
+import requests
 from azure.core.credentials_async import AsyncTokenCredential
 from azure.identity.aio import AzureCliCredential
 from azure.ai.voicelive.aio import connect
@@ -41,6 +42,7 @@ from azure.ai.voicelive.models import (
     ServerEventType,
     ServerVad,
 )
+from ddgs import DDGS
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -74,7 +76,9 @@ logger = logging.getLogger(__name__)
 
 ENDPOINT = os.environ.get("AZURE_VOICELIVE_ENDPOINT", "")
 MODEL = os.environ.get("AZURE_VOICELIVE_MODEL", "gpt-5-mini")
-VOICE = os.environ.get("AZURE_VOICELIVE_VOICE", "en-US-Ava:DragonHDLatestNeural")
+VOICE = os.environ.get("AZURE_VOICELIVE_VOICE", "en-US-AvaNeural")
+TRANSCRIPTION_MODEL = os.environ.get("AZURE_VOICELIVE_TRANSCRIPTION_MODEL", "azure-speech")
+CAPTURE_SOURCE = os.environ.get("VOICE_CAPTURE_SOURCE", "browser").strip().lower()
 AVATAR_CHARACTER = os.environ.get("AZURE_AVATAR_CHARACTER", "layla")
 AVATAR_MODEL = os.environ.get("AZURE_AVATAR_MODEL", "vasa-1")
 VAD_THRESHOLD = float(os.environ.get("VOICE_VAD_THRESHOLD", "0.74"))
@@ -91,180 +95,364 @@ ECHO_SUPPRESS_SIMILARITY = float(os.environ.get("VOICE_ECHO_SUPPRESS_SIMILARITY"
 ENABLE_LOCAL_PLAYBACK = os.environ.get("VOICE_ENABLE_LOCAL_PLAYBACK", "false").lower() in {
     "1", "true", "yes", "on"
 }
+WEB_TOOL_TIMEOUT_SECONDS = float(os.environ.get("WEB_TOOL_TIMEOUT_SECONDS", "10"))
+WEB_TOOL_MAX_RESULTS = int(os.environ.get("WEB_TOOL_MAX_RESULTS", "5"))
+WEB_TOOL_MAX_CHARS = int(os.environ.get("WEB_TOOL_MAX_CHARS", "4000"))
+WEB_TOOL_HTML_DEBUG_CHARS = int(os.environ.get("WEB_TOOL_HTML_DEBUG_CHARS", "700"))
+WEB_TOOL_FOLLOW_RESULTS = int(os.environ.get("WEB_TOOL_FOLLOW_RESULTS", "5"))
+WEB_SEARCH_ENGINE = os.environ.get("WEB_SEARCH_ENGINE", "duckduckgo").strip().lower()
+WEB_TOOL_USER_AGENT = os.environ.get(
+    "WEB_TOOL_USER_AGENT",
+    "Mozilla/5.0 (compatible; VoiceCompanionBot/1.0; +https://localhost)",
+)
+GOOGLE_SEARCH_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY", "").strip()
+GOOGLE_SEARCH_CX = os.environ.get("GOOGLE_SEARCH_CX", "").strip()
 ALLOWED_ORIGINS = {
     "http://localhost:5173",
     "http://localhost:4173",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:4173",
 }
-GENERIC_CERT_QUERY_TERMS = {
-    "first certification",
-    "no certification",
-    "no certifications",
-    "no certifications yet",
-    "beginner certification",
-    "starter certification",
-    "entry certification",
-}
+PRIVATE_NETWORKS = (
+    ip_network("127.0.0.0/8"),
+    ip_network("10.0.0.0/8"),
+    ip_network("172.16.0.0/12"),
+    ip_network("192.168.0.0/16"),
+    ip_network("169.254.0.0/16"),
+    ip_network("::1/128"),
+    ip_network("fc00::/7"),
+    ip_network("fe80::/10"),
+)
 
-SYSTEM_INSTRUCTIONS = """You are a friendly, proactive voice mentor for Course Atlas — an online course catalog.
+VOICE_SHORT_NAME_PATTERN = re.compile(r"^[a-z]{2,3}-[A-Z]{2}-[A-Za-z][A-Za-z0-9]+$")
 
-Goal:
-Help users discover the best learning path, not just run one-shot search commands.
+
+def build_voice_config(voice_name: str) -> Union[AzureStandardVoice, str]:
+    normalized_voice = voice_name.strip()
+    if not normalized_voice:
+        raise ValueError("AZURE_VOICELIVE_VOICE cannot be empty")
+
+    # Accept Azure Speech short names like es-ES-Abril and normalize them to the
+    # standard voice identifier that Voice Live expects.
+    if VOICE_SHORT_NAME_PATTERN.fullmatch(normalized_voice) and not normalized_voice.endswith("Neural"):
+        normalized_voice = f"{normalized_voice}Neural"
+
+    if "-" in normalized_voice:
+        return AzureStandardVoice(name=normalized_voice)
+
+    return normalized_voice
+
+SYSTEM_INSTRUCTIONS = """You are a warm, thoughtful voice companion and a strong technical thinking partner.
+
+Primary role:
+- Have natural, light conversations about everyday topics.
+- Go deep when the user wants serious discussion, especially about technology, emerging trends, product strategy, and project execution.
+- Help the user think clearly, structure ideas, and move toward decisions and next steps.
+
+Core capabilities:
+- Casual conversation: talk comfortably about life, work, ideas, learning, culture, and current themes.
+- Deep technology discussion: explain concepts, compare approaches, discuss tradeoffs, and help the user understand new technologies.
+- Product and project thinking: help shape vague ideas into clear goals, constraints, options, decisions, and action plans.
+- Technical execution: help with architecture, implementation strategy, sequencing, and practical engineering choices.
+- Documentation support: help draft and refine specs, plans, technical notes, decision records, and project documentation.
 
 Conversation style:
-- Be warm, clear, and concise.
-- Ask one focused follow-up question at a time.
-- Keep discovery responses short and natural.
-- Stay strictly on course discovery and learning guidance.
+- Be natural, warm, sharp, and easy to talk to.
+- Sound like a smart collaborator, not a scripted assistant.
+- Respond in the same language as the user unless asked otherwise.
+- Keep spoken responses clear and easy to follow by ear.
+- Be concise by default: usually answer in 2 to 5 spoken sentences unless the user asks for depth.
+- Do not repeat or paraphrase the user's request unless it adds real clarity.
+- Ask at most one meaningful follow-up question at a time.
+- Avoid long lists and dense monologues unless the user explicitly asks for a structured breakdown.
 
-Required flow (follow this order exactly unless the user already gave the answer):
-1) Ask for category only: AI, Cloud, Data, DevOps, Security, or Development.
-2) Ask for level only: Beginner, Intermediate, or Advanced.
-3) Ask for training type only: Certification Path, Self-paced, or Instructor-led.
-4) After you know category + level + training type, call set_filters and show the matching grounded courses.
-5) Read out up to 3 matching courses briefly and ask the user to pick one.
-6) If the user names one course or describes one clearly enough to identify it, call set_filters again with query terms that narrow to that course.
-7) After one course remains, say that the course is selected on screen and explain why it fits.
-8) Then offer next-step help such as creating a study plan.
+Reasoning behavior:
+- When the user is exploring an idea, help them clarify the problem, constraints, options, tradeoffs, and next step.
+- When the user is learning, teach progressively: start simple, then deepen.
+- When the user is deciding, compare options practically and recommend a default when there is a sensible one.
+- When the user is stuck, break the problem into the smallest useful next moves.
+- Use a light Socratic style when helpful: ask a precise question that unlocks the next part of the thinking.
 
-Suggestion behavior:
-- After understanding category + level + training type, suggest up to 3 good options briefly.
-- Mention why each option fits.
-- Invite the user to pick one or refine further.
+Product and project support:
+- Help define audience, problem statement, value proposition, scope, risks, milestones, and execution strategy.
+- Help turn fuzzy thinking into concrete plans, technical tasks, and documentation.
+- If useful, use a compact frame like goals, constraints, options, recommendation, and next steps.
 
-Catalog grounding rules (strict):
-- You must only recommend courses that exist in the provided function output for set_filters.
-- Do not invent course names, providers, levels, certifications, durations, or links.
-- If there are zero matches, clearly say no exact match was found and ask a narrowing question.
-- When listing options, quote the exact course titles from function output.
-- If exactly one grounded course remains, treat it as selected and tell the user it is selected on screen.
+Documentation behavior:
+- Think like both an engineer and a technical writer.
+- Prefer documentation that is clear, concise, concrete, and ready to use.
+- If the user wants help writing, offer structure first, then content.
 
-Filter behavior (critical):
-- Use set_filters whenever user intent implies a useful filter/search update.
-- Prefer broad filters first, then narrow as user gives more detail.
-- If user is unsure, set broader filters and ask a clarifying question.
-- Every time the user adds or changes a preference, call set_filters again before answering.
-- Treat these as filter-changing signals: category/domain, level, format/training type, provider, course title mention, certification intent, exam code, and keyword/topic refinement.
-- If the user mentions a specific course title, keep the current category/level when known and set query to the most identifying title words.
-- If the user mentions certification intent for a selected course, call set_filters again and use query to preserve the course/certification context.
-- Do not continue with generic spoken advice after the user narrows the request unless you have refreshed grounding with set_filters for that turn.
-- A plain certification-history answer like "no", "not yet", or "this is my first certification" should NOT add a query by itself.
-- Only use query for certification when the user names a real certification, exam code, or specific course/certification title.
-- Map "self-paced training" to format "Self-paced".
-- Map "certification course" to format "Certification Path".
-- Map "instructor-led training" to format "Instructor-led".
+Web browsing behavior:
+- You can use the browse_web tool when the user asks for current information, external references, documentation, news, or specific web pages.
+- Prefer search first when the user asks an open web question.
+- Prefer open when the user gives a URL or when you already found a relevant result and need details.
+- Summarize findings clearly instead of reading raw web text aloud.
+- If browsing is not necessary, answer directly without using the tool.
 
-Available filter values:
-    category: "All", "AI", "Cloud", "Data", "DevOps", "Security", "Development"
-    level: "All", "Beginner", "Intermediate", "Advanced"
-    format: "All", "Self-paced", "Instructor-led", "Certification Path"
-    provider: "" (any), "Microsoft Learn", "AWS Skill Builder", "Google Cloud Skills Boost",
-                        "Coursera", "Udemy", "Pluralsight", "Frontend Masters"
-    query: free-text keyword (empty string = no keyword filter)
+Boundaries:
+- If you are unsure about a fact, say so clearly and offer the best available interpretation or a way to verify it.
+- Do not pretend to have completed actions in external systems.
+- Do not force the conversation into a fixed workflow or narrow domain.
 
-Mapping rules:
-- Use "All" for category/level when unknown.
-- Use "All" for format when unknown.
-- Use empty string "" for provider/query when unknown.
-- Do not map generic certification-history phrases into query.
-- Use query for explicit certification identifiers only (example: "AZ-900", "SC-900", or a full certification/course title).
-- Map mentions like "identity fundamentals", "security fundamentals", or exact course names into query terms, not just spoken text.
-
-Session start requirement:
-- Use an interactive first line such as: "Hello there, I am the Course Atlas assistant. I can help you find the right course for you."
-- In the first turn, ask only: "Which field are you looking for: AI, Cloud, Data, DevOps, Security, or Development?"
-- After user answers category, ask only level in the next turn.
-- After user answers level, ask only training type in the next turn: certification course, self-paced training, or instructor-led.
-- Do not ask provider, certification history, or extra questions before those first 3 steps are complete.
-- Immediately apply a broad starter filter with set_filters (All/All/All/""/"") so the catalog is populated.
+Session start behavior:
+- Open with a brief, friendly introduction.
+- Invite the user to talk about whatever matters to them.
+- A good first turn is: "Hi, I can chat with you, think through ideas, and help with technology, products, or documentation. What do you want to explore today?"
 """
 
 
-def _extract_str(block: str, field: str) -> str:
-    match = re.search(rf"{field}:\s*'([^']*)'", block)
-    return match.group(1) if match else ""
+class HTMLTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in {"script", "style", "noscript"}:
+            self._ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript"} and self._ignored_depth > 0:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth == 0:
+            text = data.strip()
+            if text:
+                self._parts.append(text)
+
+    def get_text(self) -> str:
+        return "\n".join(self._parts)
 
 
-def _extract_tags(block: str) -> list[str]:
-    tags_match = re.search(r"tags:\s*\[([^\]]*)\]", block, flags=re.DOTALL)
-    if not tags_match:
-        return []
-    return re.findall(r"'([^']*)'", tags_match.group(1))
+def _truncate_text(value: str, max_chars: int = WEB_TOOL_MAX_CHARS) -> str:
+    cleaned = re.sub(r"\s+", " ", value).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 1].rstrip() + "…"
 
 
-def _load_catalog_from_ts() -> list[dict]:
-    # Reuse frontend catalog as the single source of truth for grounded answers.
-    ts_path = Path(__file__).resolve().parent.parent / "src" / "data" / "courses.ts"
+def _resolve_hostname_ips(hostname: str) -> list[str]:
     try:
-        content = ts_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        logger.warning("Could not load catalog file: %s", exc)
+        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
         return []
+    return [candidate for candidate in {str(info[4][0]) for info in infos}]
 
-    pattern = re.compile(r"\{\s*id:\s*'[^']+'(.*?)\n\s*\}\s*,?", flags=re.DOTALL)
-    items: list[dict] = []
-    for block in pattern.findall(content):
-        title = _extract_str(block, "title")
-        if not title:
+
+def _is_public_web_url(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    if hostname.lower() in {"localhost", "localhost.localdomain"}:
+        return False
+
+    ips_to_check: list[str] = []
+    try:
+        ips_to_check.append(str(ip_address(hostname)))
+    except ValueError:
+        ips_to_check.extend(_resolve_hostname_ips(hostname))
+
+    if not ips_to_check:
+        return False
+
+    for candidate in ips_to_check:
+        parsed_ip = ip_address(candidate)
+        if any(parsed_ip in network for network in PRIVATE_NETWORKS):
+            return False
+    return True
+
+
+def _extract_html_text(markup: str) -> str:
+    parser = HTMLTextExtractor()
+    parser.feed(markup)
+    return _truncate_text(parser.get_text())
+
+
+def _search_web_duckduckgo(query: str) -> list[dict]:
+    logger.info("browse_web search started: engine=duckduckgo query=%r", query)
+    results: list[dict] = []
+    try:
+        raw_results = DDGS().text(query, max_results=WEB_TOOL_MAX_RESULTS)
+    except Exception as exc:
+        logger.warning("browse_web duckduckgo client failed: query=%r error=%s", query, exc)
+        raise RuntimeError(f"DuckDuckGo search failed: {exc}") from exc
+
+    for item in raw_results:
+        title = _truncate_text(str(item.get("title", "")), 180)
+        snippet = _truncate_text(str(item.get("body", "")), 280)
+        url = str(item.get("href", "")).strip()
+        if not _is_public_web_url(url):
             continue
-        items.append(
-            {
-                "title": title,
-                "provider": _extract_str(block, "provider"),
-                "category": _extract_str(block, "category"),
-                "level": _extract_str(block, "level"),
-                "duration": _extract_str(block, "duration"),
-                "format": _extract_str(block, "format"),
-                "summary": _extract_str(block, "summary"),
-                "audience": _extract_str(block, "audience"),
-                "tags": _extract_tags(block),
-            }
+        results.append({"title": title, "url": url, "snippet": snippet})
+        if len(results) >= WEB_TOOL_MAX_RESULTS:
+            break
+
+    logger.info("browse_web search finished: engine=duckduckgo query=%r results=%d", query, len(results))
+    if not results:
+        logger.info("browse_web search zero results: engine=duckduckgo query=%r", query)
+    for index, result in enumerate(results, start=1):
+        logger.info(
+            "browse_web search result %d: title=%r url=%s snippet=%r",
+            index,
+            result["title"],
+            result["url"],
+            _truncate_text(result["snippet"], 160),
         )
-    return items
+    return results
 
 
-CATALOG = _load_catalog_from_ts()
+def _follow_search_results(results: list[dict], max_follow: int = WEB_TOOL_FOLLOW_RESULTS) -> list[dict]:
+    followed_pages: list[dict] = []
+    for index, result in enumerate(results[:max_follow], start=1):
+        url = result.get("url", "")
+        try:
+            page = _open_web_page(url)
+            followed_pages.append(
+                {
+                    "rank": index,
+                    "url": url,
+                    "search_title": result.get("title", ""),
+                    "search_snippet": result.get("snippet", ""),
+                    "page_title": page.get("title", ""),
+                    "content_preview": _truncate_text(page.get("content", ""), 1200),
+                }
+            )
+            logger.info(
+                "browse_web followed result %d: url=%s page_title=%r preview=%r",
+                index,
+                url,
+                page.get("title", ""),
+                _truncate_text(page.get("content", ""), 180),
+            )
+        except Exception as exc:
+            logger.warning("browse_web follow failed for result %d url=%s: %s", index, url, exc)
+            followed_pages.append(
+                {
+                    "rank": index,
+                    "url": url,
+                    "search_title": result.get("title", ""),
+                    "search_snippet": result.get("snippet", ""),
+                    "status": "error",
+                    "message": str(exc),
+                }
+            )
+    return followed_pages
 
-# ── Tool definition ───────────────────────────────────────────────────────────
 
-SET_FILTERS_TOOL = FunctionTool(
-    name="set_filters",
-    description="Update the course catalog filters so the user sees matching courses in real-time.",
+def _search_web_google_cse(query: str) -> list[dict]:
+    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_CX:
+        raise RuntimeError(
+            "Google search engine is configured but GOOGLE_SEARCH_API_KEY or GOOGLE_SEARCH_CX is missing"
+        )
+
+    logger.info("browse_web search started: engine=google_cse query=%r", query)
+    response = requests.get(
+        "https://www.googleapis.com/customsearch/v1",
+        params={
+            "key": GOOGLE_SEARCH_API_KEY,
+            "cx": GOOGLE_SEARCH_CX,
+            "q": query,
+            "num": min(WEB_TOOL_MAX_RESULTS, 10),
+            "hl": "es",
+        },
+        headers={"User-Agent": WEB_TOOL_USER_AGENT},
+        timeout=WEB_TOOL_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    items = payload.get("items", []) or []
+    results: list[dict] = []
+    for item in items[:WEB_TOOL_MAX_RESULTS]:
+        title = _truncate_text(str(item.get("title", "")), 180)
+        url = str(item.get("link", "")).strip()
+        snippet = _truncate_text(str(item.get("snippet", "")), 280)
+        if not url or not _is_public_web_url(url):
+            continue
+        results.append({"title": title, "url": url, "snippet": snippet})
+
+    logger.info("browse_web search finished: engine=google_cse query=%r results=%d", query, len(results))
+    for index, result in enumerate(results, start=1):
+        logger.info(
+            "browse_web search result %d: title=%r url=%s snippet=%r",
+            index,
+            result["title"],
+            result["url"],
+            _truncate_text(result["snippet"], 160),
+        )
+    return results
+
+
+def _search_web(query: str) -> list[dict]:
+    if WEB_SEARCH_ENGINE == "google_cse":
+        return _search_web_google_cse(query)
+    if WEB_SEARCH_ENGINE == "duckduckgo":
+        return _search_web_duckduckgo(query)
+    raise RuntimeError(f"Unsupported WEB_SEARCH_ENGINE: {WEB_SEARCH_ENGINE}")
+
+
+def _open_web_page(url: str) -> dict:
+    if not _is_public_web_url(url):
+        raise ValueError("Only public http/https URLs are allowed")
+
+    logger.info("browse_web open started: url=%s", url)
+
+    response = requests.get(
+        url,
+        headers={"User-Agent": WEB_TOOL_USER_AGENT},
+        timeout=WEB_TOOL_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", response.text, flags=re.IGNORECASE | re.DOTALL)
+    title = _truncate_text(_extract_html_text(html.unescape(title_match.group(1))), 180) if title_match else url
+    text = _extract_html_text(response.text)
+    result = {
+        "url": url,
+        "title": title,
+        "content": text,
+    }
+    logger.info(
+        "browse_web open finished: url=%s title=%r content_preview=%r",
+        url,
+        title,
+        _truncate_text(text, 220),
+    )
+    return result
+
+
+BROWSE_WEB_TOOL = FunctionTool(
+    name="browse_web",
+    description="Search the public web or open a public web page to gather current information and references.",
     parameters={
         "type": "object",
         "properties": {
-            "category": {
+            "action": {
                 "type": "string",
-                "enum": ["All", "AI", "Cloud", "Data", "DevOps", "Security", "Development"],
-                "description": "Course category, or 'All'.",
-            },
-            "level": {
-                "type": "string",
-                "enum": ["All", "Beginner", "Intermediate", "Advanced"],
-                "description": "Experience level, or 'All'.",
-            },
-            "format": {
-                "type": "string",
-                "enum": ["All", "Self-paced", "Instructor-led", "Certification Path"],
-                "description": "Training type / course format, or 'All'.",
-            },
-            "provider": {
-                "type": "string",
-                "description": "Training provider name, or empty string for any.",
+                "enum": ["search", "open"],
+                "description": "Use 'search' for web search, or 'open' to fetch a specific public web page.",
             },
             "query": {
                 "type": "string",
-                "description": "Free-text keyword, or empty string.",
+                "description": "Search terms to use when action is 'search'.",
+            },
+            "url": {
+                "type": "string",
+                "description": "Public http/https URL to open when action is 'open'.",
             },
         },
-        "required": ["category", "level", "format", "provider", "query"],
+        "required": ["action"],
     },
 )
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Course Atlas Voice Server")
+app = FastAPI(title="General Voice Companion Server")
 
 app.add_middleware(
     CORSMiddleware,
@@ -320,6 +508,7 @@ class VoiceSession:
         self._last_assistant_text = ""
         self._last_assistant_spoke_at = 0.0
         self._pending_barge_in = False
+        self._pending_tool_followup_response = False
         self._avatar_answer_event = asyncio.Event()
         self._avatar_server_sdp: Optional[str] = None
 
@@ -344,60 +533,6 @@ class VoiceSession:
 
         ratio = difflib.SequenceMatcher(None, user_norm, ai_norm).ratio()
         return ratio >= ECHO_SUPPRESS_SIMILARITY
-
-    def _filter_catalog(self, args: dict) -> list[dict]:
-        category = (args.get("category") or "All").strip()
-        level = (args.get("level") or "All").strip()
-        course_format = (args.get("format") or "All").strip()
-        provider = (args.get("provider") or "").strip()
-        query = (args.get("query") or "").strip().lower()
-
-        matches: list[dict] = []
-        for course in CATALOG:
-            if category != "All" and course.get("category") != category:
-                continue
-            if level != "All" and course.get("level") != level:
-                continue
-            if course_format != "All" and course.get("format") != course_format:
-                continue
-            if provider and course.get("provider") != provider:
-                continue
-
-            if query:
-                haystack = " ".join(
-                    [
-                        course.get("title", ""),
-                        course.get("provider", ""),
-                        course.get("summary", ""),
-                        course.get("audience", ""),
-                        " ".join(course.get("tags", [])),
-                    ]
-                ).lower()
-                if query not in haystack:
-                    continue
-
-            matches.append(
-                {
-                    "title": course.get("title", ""),
-                    "provider": course.get("provider", ""),
-                    "category": course.get("category", ""),
-                    "level": course.get("level", ""),
-                    "duration": course.get("duration", ""),
-                    "format": course.get("format", ""),
-                    "summary": course.get("summary", ""),
-                }
-            )
-        return matches
-
-    @staticmethod
-    def _normalize_filter_args(args: dict) -> dict:
-        normalized = dict(args)
-        if not normalized.get("format"):
-            normalized["format"] = "All"
-        query = (normalized.get("query") or "").strip().lower()
-        if query in GENERIC_CERT_QUERY_TERMS:
-            normalized["query"] = ""
-        return normalized
 
     async def _send(self, msg: dict) -> None:
         try:
@@ -438,6 +573,11 @@ class VoiceSession:
                 if msg.get("type") == "stop":
                     self._running = False
                     break
+                if msg.get("type") == "input_audio":
+                    audio = msg.get("audio", "")
+                    if audio and self.connection is not None:
+                        await self.connection.input_audio_buffer.append(audio=audio)
+                    continue
                 if msg.get("type") == "avatar_offer":
                     await self._send({"type": "avatar_connecting"})
                     client_sdp = msg.get("sdp", "")
@@ -472,9 +612,7 @@ class VoiceSession:
             return None
 
     async def _configure_session(self) -> None:
-        voice: Union[AzureStandardVoice, str] = (
-            AzureStandardVoice(name=VOICE) if "-" in VOICE else VOICE
-        )
+        voice = build_voice_config(VOICE)
         
         assert self.connection is not None
         await self.connection.session.update(
@@ -493,17 +631,19 @@ class VoiceSession:
                 input_audio_noise_reduction=AudioNoiseReduction(
                     type="azure_deep_noise_suppression"
                 ),
-                input_audio_transcription=AudioInputTranscriptionOptions(model="whisper-1"),
+                input_audio_transcription=AudioInputTranscriptionOptions(
+                    model=TRANSCRIPTION_MODEL
+                ),
                 avatar=AvatarConfig(
                     type=AvatarConfigTypes.PHOTO_AVATAR,
                     character=AVATAR_CHARACTER,
                     model=AVATAR_MODEL,
                 ),
-                tools=[SET_FILTERS_TOOL],
+                tools=[BROWSE_WEB_TOOL],
             )
         )
         logger.info(
-            "Session configured — set_filters tool registered, photo_avatar=%s (model=%s)",
+            "Session configured — general voice companion ready with web browsing, photo_avatar=%s (model=%s)",
             AVATAR_CHARACTER,
             AVATAR_MODEL,
         )
@@ -531,7 +671,11 @@ class VoiceSession:
             await self._send({"type": "avatar_ice_servers", "servers": ice_servers})
             logger.info("Avatar ICE servers sent to frontend: %d", len(ice_servers))
 
-            ap.start_capture()
+            if CAPTURE_SOURCE == "local":
+                ap.start_capture()
+                logger.info("Capturing microphone from backend host via PyAudio")
+            else:
+                logger.info("Capturing microphone from browser websocket stream")
             await self._send({"type": "status", "value": "ready"})
 
         elif etype == ServerEventType.SESSION_AVATAR_CONNECTING or "avatar" in str(etype).lower():
@@ -595,56 +739,73 @@ class VoiceSession:
                 logger.info("AI spoke: %.120s", text)
                 await self._send({"type": "transcript", "role": "assistant", "text": text})
 
-        # ── Function call — set_filters ───────────────────────────────────
         elif etype == ServerEventType.RESPONSE_FUNCTION_CALL_ARGUMENTS_DONE:
             func_name = getattr(event, "name", "")
             call_id = getattr(event, "call_id", "")
             raw_args = getattr(event, "arguments", "{}") or "{}"
             logger.info("Function call '%s' args: %s", func_name, raw_args)
 
-            if func_name == "set_filters":
+            if func_name == "browse_web":
                 try:
                     args = json.loads(raw_args)
-                    args = self._normalize_filter_args(args)
-                    await self._send({"type": "filter", **args})
-                    logger.info("Filter sent to browser: %s", args)
                 except json.JSONDecodeError as exc:
-                    logger.warning("Bad JSON in function args: %s — %s", raw_args, exc)
-                    args = {
-                        "category": "All",
-                        "level": "All",
-                        "format": "All",
-                        "provider": "",
-                        "query": "",
+                    logger.warning("Bad JSON in browse_web args: %s — %s", raw_args, exc)
+                    args = {}
+
+                action = (args.get("action") or "").strip().lower()
+                tool_output: dict
+
+                try:
+                    if action == "search":
+                        query = (args.get("query") or "").strip()
+                        if not query:
+                            raise ValueError("query is required for search")
+                        results = _search_web(query)
+                        followed_pages = _follow_search_results(results)
+                        tool_output = {
+                            "status": "ok",
+                            "action": "search",
+                            "query": query,
+                            "results": results,
+                            "followed_pages": followed_pages,
+                        }
+                    elif action == "open":
+                        url = (args.get("url") or "").strip()
+                        if not url:
+                            raise ValueError("url is required for open")
+                        page = _open_web_page(url)
+                        tool_output = {
+                            "status": "ok",
+                            "action": "open",
+                            **page,
+                        }
+                    else:
+                        raise ValueError("action must be 'search' or 'open'")
+                except Exception as exc:
+                    logger.warning("browse_web failed: %s", exc)
+                    tool_output = {
+                        "status": "error",
+                        "action": action or "unknown",
+                        "message": str(exc),
                     }
 
-                grounded_matches = self._filter_catalog(args)
-                if not grounded_matches and (args.get("query") or "").strip().lower() in GENERIC_CERT_QUERY_TERMS:
-                    args["query"] = ""
-                    grounded_matches = self._filter_catalog(args)
-                logger.info("Grounded course matches: %d", len(grounded_matches))
-
-                # Tell the AI the function completed so it continues speaking
                 try:
                     await conn.conversation.item.create(
                         item=FunctionCallOutputItem(
                             call_id=call_id,
-                            output=json.dumps(
-                                {
-                                    "status": "ok",
-                                    "filters": args,
-                                    "total_matches": len(grounded_matches),
-                                    "available_courses": grounded_matches[:12],
-                                    "note": "Recommend only courses from available_courses.",
-                                }
-                            ),
+                            output=json.dumps(tool_output),
                         )
                     )
-                    # Explicitly ask the model to continue after tool output.
-                    # Without this, the response may end right after function execution.
-                    await conn.response.create()
+                    if self._active_response and not self._response_api_done:
+                        self._pending_tool_followup_response = True
+                        logger.info(
+                            "Deferred response.create after browse_web because a response is still active"
+                        )
+                    else:
+                        logger.info("Calling response.create immediately after browse_web")
+                        await conn.response.create()
                 except Exception as exc:
-                    logger.warning("Could not return function result: %s", exc)
+                    logger.warning("Could not return browse_web result: %s", exc)
 
         # ── User speech transcript ────────────────────────────────────────
         elif etype == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
@@ -676,7 +837,16 @@ class VoiceSession:
             )
             ap.duck_capture(tail_guard)
             logger.info("Post-response mic duck: %.1fs (transcript ~%d chars)", tail_guard, spoken_chars)
-            await self._send({"type": "status", "value": "ready"})
+            if self._pending_tool_followup_response:
+                self._pending_tool_followup_response = False
+                try:
+                    logger.info("Calling deferred response.create after response.done")
+                    await conn.response.create()
+                except Exception as exc:
+                    logger.warning("Deferred response.create failed: %s", exc)
+                    await self._send({"type": "status", "value": "ready"})
+            else:
+                await self._send({"type": "status", "value": "ready"})
 
         elif etype == ServerEventType.RESPONSE_ANIMATION_BLENDSHAPES_DELTA:
             # Avatar blendshape animation data — silently handled by the connection
@@ -809,7 +979,7 @@ class AudioProc:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Course Atlas Voice Server")
+    print("General Voice Companion Server")
     print("=" * 40)
     print("WebSocket : ws://localhost:8765/ws")
     print("Health    : http://localhost:8765/health")

@@ -1,15 +1,43 @@
-# Azure VoiceLive SDK
-azure-ai-voicelive
-
-# Azure identity for token-based auth
-azure-identity
-
-# Audio I/O
-pyaudio
-
-# Environment variable loading
-python-dotenv
-
-# Voice server (WebSocket bridge to React frontend)
-fastapi
-uvicorn[standard]
+aiohappyeyeballs==2.6.1
+aiohttp==3.13.5
+aiosignal==1.4.0
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.13.0
+attrs==26.1.0
+azure-ai-voicelive==1.2.0b5
+azure-core==1.41.0
+azure-identity==1.25.3
+certifi==2026.4.22
+cffi==2.0.0
+charset-normalizer==3.4.7
+click==8.3.3
+colorama==0.4.6
+cryptography==48.0.0
+ddgs==9.14.2
+fastapi==0.136.1
+frozenlist==1.8.0
+h11==0.16.0
+httptools==0.7.1
+idna==3.13
+isodate==0.7.2
+msal==1.36.0
+msal-extensions==1.3.1
+multidict==6.7.1
+propcache==0.5.2
+PyAudio==0.2.14
+pycparser==3.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+PyJWT==2.12.1
+python-dotenv==1.2.2
+PyYAML==6.0.3
+requests==2.33.1
+starlette==1.0.0
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+urllib3==2.7.0
+uvicorn==0.46.0
+watchfiles==1.1.1
+websockets==16.0
+yarl==1.23.0

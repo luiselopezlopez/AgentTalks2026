@@ -1,55 +1,150 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { courses } from './data/courses'
+import { useEffect, useRef, useState } from 'react'
 
-const categories = ['All', 'AI', 'Cloud', 'Data', 'DevOps', 'Security', 'Development'] as const
-const levels = ['All', 'Beginner', 'Intermediate', 'Advanced'] as const
-const formats = ['All', 'Self-paced', 'Instructor-led', 'Certification Path'] as const
-const providers = ['All', ...new Set(courses.map((c) => c.provider))]
-
-type Category = (typeof categories)[number]
-type Level = (typeof levels)[number]
-type Format = (typeof formats)[number]
 type VoiceStatus = 'idle' | 'connecting' | 'connected' | 'ready' | 'listening' | 'processing' | 'speaking' | 'error'
 interface ChatMsg { id: number; role: 'user' | 'assistant'; text: string }
 
+const TARGET_SAMPLE_RATE = 24000
+
 const STATUS_LABEL: Record<VoiceStatus, string> = {
-  idle:        'Press to start voice search',
+  idle:        'Initializing avatar…',
   connecting:  'Connecting to voice AI…',
   connected:   'Voice AI connected',
   ready:       'Ready — speak now',
   listening:   'Listening…',
   processing:  'Thinking…',
   speaking:    'Speaking…',
-  error:       'Connection error — close and retry',
-}
-
-function isCategory(v: string): v is Category {
-  return (categories as readonly string[]).includes(v)
-}
-function isLevel(v: string): v is Level {
-  return (levels as readonly string[]).includes(v)
-}
-function isFormat(v: string): v is Format {
-  return (formats as readonly string[]).includes(v)
+  error:       'Connection error — reload to retry',
 }
 
 function App() {
-  const [query, setQuery] = useState('')
-  const [category, setCategory] = useState<Category>('All')
-  const [provider, setProvider] = useState('All')
-  const [level, setLevel] = useState<Level>('All')
-  const [format, setFormat] = useState<Format>('All')
-
   // Voice chat state
-  const [voiceOpen, setVoiceOpen] = useState(false)
+  const voiceOpen = true
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>('idle')
   const [avatarReady, setAvatarReady] = useState(false)
+  const [mediaActivationRequired, setMediaActivationRequired] = useState(false)
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const wsRef = useRef<WebSocket | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const micStreamRef = useRef<MediaStream | null>(null)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null)
+
+  const encodePcm16 = (input: Float32Array) => {
+    const pcm = new Int16Array(input.length)
+    for (let index = 0; index < input.length; index += 1) {
+      const sample = Math.max(-1, Math.min(1, input[index] ?? 0))
+      pcm[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff
+    }
+
+    const bytes = new Uint8Array(pcm.buffer)
+    let binary = ''
+    const chunkSize = 0x8000
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize))
+    }
+    return btoa(binary)
+  }
+
+  const downsampleTo24k = (input: Float32Array, sampleRate: number) => {
+    if (sampleRate === TARGET_SAMPLE_RATE) return input
+
+    const ratio = sampleRate / TARGET_SAMPLE_RATE
+    const outputLength = Math.max(1, Math.round(input.length / ratio))
+    const output = new Float32Array(outputLength)
+
+    let inputOffset = 0
+    for (let outputIndex = 0; outputIndex < outputLength; outputIndex += 1) {
+      const nextOffset = Math.min(input.length, Math.round((outputIndex + 1) * ratio))
+      let accumulator = 0
+      let count = 0
+      for (let index = inputOffset; index < nextOffset; index += 1) {
+        accumulator += input[index] ?? 0
+        count += 1
+      }
+      output[outputIndex] = count > 0 ? accumulator / count : input[inputOffset] ?? 0
+      inputOffset = nextOffset
+    }
+
+    return output
+  }
+
+  const stopMicrophoneCapture = () => {
+    audioProcessorRef.current?.disconnect()
+    audioSourceRef.current?.disconnect()
+    micStreamRef.current?.getTracks().forEach((track) => track.stop())
+    void audioContextRef.current?.close()
+
+    audioProcessorRef.current = null
+    audioSourceRef.current = null
+    micStreamRef.current = null
+    audioContextRef.current = null
+  }
+
+  const resumeMediaPlayback = async () => {
+    const tasks: Array<Promise<unknown>> = []
+
+    if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      tasks.push(audioContextRef.current.resume())
+    }
+
+    if (videoRef.current && videoRef.current.srcObject) {
+      tasks.push(videoRef.current.play())
+    }
+
+    if (audioRef.current && audioRef.current.srcObject) {
+      tasks.push(audioRef.current.play())
+    }
+
+    if (tasks.length === 0) {
+      setMediaActivationRequired(false)
+      return
+    }
+
+    const results = await Promise.allSettled(tasks)
+    const hasFailures = results.some((result) => result.status === 'rejected')
+    const audioStillSuspended = audioContextRef.current?.state === 'suspended'
+    setMediaActivationRequired(hasFailures || Boolean(audioStillSuspended))
+  }
+
+  const startMicrophoneCapture = async (ws: WebSocket) => {
+    if (micStreamRef.current || audioContextRef.current) return
+
+    const mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: false,
+    })
+
+    const audioContext = new AudioContext()
+    const source = audioContext.createMediaStreamSource(mediaStream)
+    const processor = audioContext.createScriptProcessor(4096, 1, 1)
+
+    processor.onaudioprocess = (event) => {
+      if (ws.readyState !== WebSocket.OPEN) return
+
+      const mono = event.inputBuffer.getChannelData(0)
+      const downsampled = downsampleTo24k(mono, audioContext.sampleRate)
+      ws.send(JSON.stringify({ type: 'input_audio', audio: encodePcm16(downsampled) }))
+    }
+
+    source.connect(processor)
+    processor.connect(audioContext.destination)
+
+    micStreamRef.current = mediaStream
+    audioContextRef.current = audioContext
+    audioSourceRef.current = source
+    audioProcessorRef.current = processor
+
+    await resumeMediaPlayback()
+  }
 
   const closePeerConnection = () => {
     if (pcRef.current) {
@@ -101,15 +196,18 @@ function App() {
     pc.ontrack = (event) => {
       if (event.track.kind === 'video' && videoRef.current) {
         videoRef.current.srcObject = event.streams[0]
+        void resumeMediaPlayback()
       }
       if (event.track.kind === 'audio' && audioRef.current) {
         audioRef.current.srcObject = event.streams[0]
+        void resumeMediaPlayback()
       }
     }
 
     pc.oniceconnectionstatechange = () => {
       if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
         setAvatarReady(true)
+        void resumeMediaPlayback()
       }
       if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
         setAvatarReady(false)
@@ -136,6 +234,22 @@ function App() {
     }
   }, [messages])
 
+  useEffect(() => {
+    if (!mediaActivationRequired) return
+
+    const unlockMedia = () => {
+      void resumeMediaPlayback()
+    }
+
+    window.addEventListener('pointerdown', unlockMedia)
+    window.addEventListener('keydown', unlockMedia)
+
+    return () => {
+      window.removeEventListener('pointerdown', unlockMedia)
+      window.removeEventListener('keydown', unlockMedia)
+    }
+  }, [mediaActivationRequired])
+
   // WebSocket lifecycle — opens when panel opens, closes when panel closes
   useEffect(() => {
     if (!voiceOpen) return
@@ -155,6 +269,9 @@ function App() {
         setVoiceStatus(msg.value as VoiceStatus)
       } else if (msg.type === 'connected') {
         setVoiceStatus('connected')
+        void startMicrophoneCapture(ws).catch(() => {
+          setVoiceStatus('error')
+        })
       } else if (msg.type === 'avatar_ice_servers') {
         void handleAvatarIceServers(msg.servers as Array<{ urls: string[]; username?: string; credential?: string }>)
       } else if (msg.type === 'avatar_connecting') {
@@ -168,12 +285,6 @@ function App() {
         setAvatarReady(true)
       } else if (msg.type === 'avatar_error') {
         setAvatarReady(false)
-      } else if (msg.type === 'filter') {
-        if (isCategory(msg.category)) setCategory(msg.category)
-        if (isLevel(msg.level)) setLevel(msg.level)
-        if (isFormat(msg.format)) setFormat(msg.format)
-        if (msg.provider !== undefined) setProvider((msg.provider as string) || 'All')
-        if (msg.query !== undefined) setQuery((msg.query as string) || '')
       } else if (msg.type === 'transcript') {
         setMessages((prev) => [
           ...prev,
@@ -187,6 +298,8 @@ function App() {
     ws.onclose = () => {
       setVoiceStatus('idle')
       setAvatarReady(false)
+      setMediaActivationRequired(false)
+      stopMicrophoneCapture()
       closePeerConnection()
       wsRef.current = null
     }
@@ -194,165 +307,49 @@ function App() {
     ws.onerror = () => {
       setVoiceStatus('error')
       setAvatarReady(false)
+      setMediaActivationRequired(false)
+      stopMicrophoneCapture()
     }
 
     return () => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'stop' }))
       }
+      stopMicrophoneCapture()
       ws.close()
       closePeerConnection()
       wsRef.current = null
     }
   }, [voiceOpen])
 
-  const filteredCourses = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    return courses.filter((course) => {
-      const matchesQuery =
-        q.length === 0 ||
-        [course.title, course.provider, course.summary, course.audience, ...course.tags]
-          .join(' ')
-          .toLowerCase()
-          .includes(q)
-      return (
-        matchesQuery &&
-        (category === 'All' || course.category === category) &&
-        (format === 'All' || course.format === format) &&
-        (provider === 'All' || course.provider === provider) &&
-        (level === 'All' || course.level === level)
-      )
-    })
-  }, [category, format, level, provider, query])
-
-  const isVoiceActive = voiceOpen && voiceStatus !== 'idle' && voiceStatus !== 'error'
+  const voicePanelClassName = 'voice-drawer voice-drawer--fullscreen'
 
   return (
-    <div className="page-shell">
+    <div className="page-shell page-shell--avatar-mode">
       <div className="backdrop backdrop-one" />
       <div className="backdrop backdrop-two" />
 
-      <main className="app-frame">
-        {/* ── Hero ── */}
-        <section className="hero-panel">
-          <div className="hero-copy">
-            <p className="eyebrow">Course catalog</p>
-            <h1>Course Atlas</h1>
+      <main className="app-frame app-frame--avatar-mode">
+        <section className="avatar-page-shell">
+          <div className="avatar-page-copy">
+            <p className="eyebrow">Voice companion</p>
+            <h1>Talk to your AI companion</h1>
             <p className="hero-text">
-              Browse and filter courses to find the right learning path.
+              The session starts automatically. Talk naturally about everyday topics, technology, ideas, projects, or documentation.
             </p>
           </div>
         </section>
-
-        {/* ── Controls ── */}
-        <section className="controls-panel">
-          <div className="search-wrap">
-            <label htmlFor="course-search">Search courses</label>
-            <input
-              id="course-search"
-              type="search"
-              placeholder="Search Azure, AI, certification, DevOps…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-            />
-          </div>
-
-          <div className="category-pills" aria-label="Filter by category">
-            {categories.map((item) => (
-              <button
-                key={item}
-                type="button"
-                className={item === category ? 'pill active' : 'pill'}
-                onClick={() => setCategory(item)}
-              >
-                {item}
-              </button>
-            ))}
-          </div>
-
-          <div className="select-grid">
-            <label>
-              Provider
-              <select value={provider} onChange={(e) => setProvider(e.target.value)}>
-                {providers.map((item) => (
-                  <option key={item} value={item}>{item}</option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              Level
-              <select value={level} onChange={(e) => setLevel(e.target.value as Level)}>
-                {levels.map((item) => (
-                  <option key={item} value={item}>{item}</option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              Training type
-              <select value={format} onChange={(e) => setFormat(e.target.value as Format)}>
-                {formats.map((item) => (
-                  <option key={item} value={item}>{item}</option>
-                ))}
-              </select>
-            </label>
-          </div>
-        </section>
-
-        {/* ── Results header ── */}
-        <section className="results-header">
-          <div>
-            <p className="results-label">Course results</p>
-            <h2>{filteredCourses.length} matching courses</h2>
-          </div>
-        </section>
-
-        {/* ── Course grid ── */}
-        <section className="course-grid">
-          {filteredCourses.map((course) => (
-            <article key={course.id} className={`course-card${isVoiceActive ? ' course-card--voice-active' : ''}`}>
-              <div className="card-topline">
-                <span className="category-chip">{course.category}</span>
-                <span className="format-chip">{course.format}</span>
-              </div>
-              <h3>{course.title}</h3>
-              <p className="provider-line">{course.provider} · {course.level} · {course.duration}</p>
-              <p className="summary-line">{course.summary}</p>
-              <p className="audience-line">Best for: {course.audience}</p>
-              <div className="tag-row">
-                {course.tags.map((tag) => (
-                  <span key={tag} className="tag">{tag}</span>
-                ))}
-              </div>
-            </article>
-          ))}
-        </section>
-
-        {filteredCourses.length === 0 && (
-          <section className="empty-state">
-            <h3>No courses matched this search.</h3>
-            <p>Try broader keywords like "cloud", "AI", "certification", or reset a filter.</p>
-          </section>
-        )}
       </main>
 
       {/* ── Voice chat drawer ── */}
       {voiceOpen && (
-        <div className="voice-drawer" role="dialog" aria-label="Voice search assistant">
+        <div className={voicePanelClassName} role="dialog" aria-label="Voice companion">
           <div className="voice-drawer-head">
             <span className={`voice-orb voice-orb--${voiceStatus}`} aria-hidden="true" />
             <div className="voice-drawer-headings">
-              <p className="voice-drawer-title">Voice Search</p>
+              <p className="voice-drawer-title">AI Companion</p>
               <p className="voice-drawer-status">{STATUS_LABEL[voiceStatus]}</p>
             </div>
-            <button
-              className="voice-drawer-close"
-              onClick={() => setVoiceOpen(false)}
-              aria-label="Close voice search"
-            >
-              ✕
-            </button>
           </div>
 
           <div className="avatar-stage" aria-live="polite">
@@ -361,16 +358,21 @@ function App() {
             {!avatarReady && (
               <p className="avatar-loading">Connecting avatar stream…</p>
             )}
+            {mediaActivationRequired && (
+              <button className="avatar-activation" type="button" onClick={() => void resumeMediaPlayback()}>
+                Tap to enable avatar audio and video
+              </button>
+            )}
           </div>
 
           <div className="voice-transcript" ref={scrollRef}>
             {messages.length === 0 && (
               <p className="voice-hint">
                 {voiceStatus === 'connecting' || voiceStatus === 'connected'
-                  ? 'Starting the voice assistant…'
+                  ? 'Starting your AI companion…'
                   : voiceStatus === 'error'
                   ? undefined
-                  : 'Ask what you are looking for.'}
+                  : 'Say hello, ask a question, or explore an idea.'}
               </p>
             )}
 
@@ -389,18 +391,6 @@ function App() {
           </div>
         </div>
       )}
-
-      {/* ── Floating voice button (mobile / quick access) ── */}
-      <button
-        className={`voice-fab${voiceOpen ? ' voice-fab--open' : ''}`}
-        onClick={() => setVoiceOpen((v) => !v)}
-        aria-pressed={voiceOpen}
-        aria-label={voiceOpen ? 'Close voice search' : 'Open voice search'}
-        title={voiceOpen ? 'Close voice search' : 'Search with your voice'}
-      >
-        <span aria-hidden="true">{voiceOpen ? '✕' : '🎤'}</span>
-        <span className="voice-fab-label">{voiceOpen ? 'Close' : 'Voice'}</span>
-      </button>
     </div>
   )
 }
