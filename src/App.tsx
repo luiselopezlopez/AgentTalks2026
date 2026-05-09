@@ -21,6 +21,7 @@ function App() {
   const voiceOpen = true
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>('idle')
   const [avatarReady, setAvatarReady] = useState(false)
+  const [avatarNotice, setAvatarNotice] = useState<string | null>(null)
   const [mediaActivationRequired, setMediaActivationRequired] = useState(false)
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const wsRef = useRef<WebSocket | null>(null)
@@ -32,6 +33,8 @@ function App() {
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
   const audioProcessorRef = useRef<ScriptProcessorNode | null>(null)
+  const avatarReadyRef = useRef(false)
+  const playbackCursorRef = useRef(0)
 
   const encodePcm16 = (input: Float32Array) => {
     const pcm = new Int16Array(input.length)
@@ -82,6 +85,40 @@ function App() {
     audioSourceRef.current = null
     micStreamRef.current = null
     audioContextRef.current = null
+    playbackCursorRef.current = 0
+  }
+
+  const playRemoteAudioChunk = async (audioBase64: string, sampleRate: number) => {
+    if (avatarReadyRef.current) return
+
+    const audioContext = audioContextRef.current
+    if (!audioContext) return
+
+    const binary = atob(audioBase64)
+    const bytes = new Uint8Array(binary.length)
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index)
+    }
+
+    const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2))
+    const samples = new Float32Array(pcm.length)
+    for (let index = 0; index < pcm.length; index += 1) {
+      const value = pcm[index] ?? 0
+      samples[index] = value < 0 ? value / 0x8000 : value / 0x7fff
+    }
+
+    const buffer = audioContext.createBuffer(1, samples.length, sampleRate)
+    buffer.copyToChannel(samples, 0)
+
+    const source = audioContext.createBufferSource()
+    source.buffer = buffer
+    source.connect(audioContext.destination)
+
+    const baseTime = Math.max(audioContext.currentTime + 0.02, playbackCursorRef.current || 0)
+    source.start(baseTime)
+    playbackCursorRef.current = baseTime + buffer.duration
+
+    await resumeMediaPlayback()
   }
 
   const resumeMediaPlayback = async () => {
@@ -183,6 +220,8 @@ function App() {
 
     closePeerConnection()
     setAvatarReady(false)
+    avatarReadyRef.current = false
+    setAvatarNotice(null)
 
     const pc = new RTCPeerConnection({
       iceServers: servers.map((server) => ({
@@ -207,10 +246,14 @@ function App() {
     pc.oniceconnectionstatechange = () => {
       if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
         setAvatarReady(true)
+        avatarReadyRef.current = true
+        setAvatarNotice(null)
         void resumeMediaPlayback()
       }
       if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
         setAvatarReady(false)
+        avatarReadyRef.current = false
+        setAvatarNotice('Avatar stream could not be established. Audio will continue without video.')
       }
     }
 
@@ -256,6 +299,8 @@ function App() {
 
     setVoiceStatus('connecting')
     setAvatarReady(false)
+    avatarReadyRef.current = false
+    setAvatarNotice(null)
     setMessages([])
 
     const ws = new WebSocket('ws://127.0.0.1:8765/ws')
@@ -273,9 +318,12 @@ function App() {
           setVoiceStatus('error')
         })
       } else if (msg.type === 'avatar_ice_servers') {
+        setAvatarNotice(null)
         void handleAvatarIceServers(msg.servers as Array<{ urls: string[]; username?: string; credential?: string }>)
       } else if (msg.type === 'avatar_connecting') {
         setAvatarReady(false)
+        avatarReadyRef.current = false
+        setAvatarNotice('Connecting avatar stream…')
       } else if (msg.type === 'avatar_answer') {
         const payload = JSON.parse(atob(msg.sdp as string)) as RTCSessionDescriptionInit
         if (pcRef.current) {
@@ -283,8 +331,18 @@ function App() {
         }
       } else if (msg.type === 'avatar_ready') {
         setAvatarReady(true)
+        avatarReadyRef.current = true
+        setAvatarNotice(null)
       } else if (msg.type === 'avatar_error') {
         setAvatarReady(false)
+        avatarReadyRef.current = false
+        setAvatarNotice((msg.message as string | undefined) ?? 'Avatar is not available for this session. Audio will continue without video.')
+      } else if (msg.type === 'audio_chunk') {
+        void playRemoteAudioChunk(msg.audio as string, Number(msg.sampleRate ?? TARGET_SAMPLE_RATE))
+      } else if (msg.type === 'audio_done') {
+        if (audioContextRef.current) {
+          playbackCursorRef.current = Math.max(playbackCursorRef.current, audioContextRef.current.currentTime)
+        }
       } else if (msg.type === 'transcript') {
         setMessages((prev) => [
           ...prev,
@@ -298,6 +356,8 @@ function App() {
     ws.onclose = () => {
       setVoiceStatus('idle')
       setAvatarReady(false)
+      avatarReadyRef.current = false
+      setAvatarNotice(null)
       setMediaActivationRequired(false)
       stopMicrophoneCapture()
       closePeerConnection()
@@ -307,6 +367,8 @@ function App() {
     ws.onerror = () => {
       setVoiceStatus('error')
       setAvatarReady(false)
+      avatarReadyRef.current = false
+      setAvatarNotice(null)
       setMediaActivationRequired(false)
       stopMicrophoneCapture()
     }
@@ -356,7 +418,7 @@ function App() {
             <video ref={videoRef} className="avatar-video" autoPlay playsInline />
             <audio ref={audioRef} autoPlay />
             {!avatarReady && (
-              <p className="avatar-loading">Connecting avatar stream…</p>
+              <p className="avatar-loading">{avatarNotice ?? 'Connecting avatar stream…'}</p>
             )}
             {mediaActivationRequired && (
               <button className="avatar-activation" type="button" onClick={() => void resumeMediaPlayback()}>
@@ -378,8 +440,8 @@ function App() {
 
             {voiceStatus === 'error' && (
               <p className="voice-hint voice-hint--error">
-                Could not connect to the voice server. Make sure it is running:
-                <code>cd voice &amp;&amp; python server.py</code>
+                Could not connect to the voice server. Make sure the Foundry agent server is running:
+                <code>cd luiseagent &amp;&amp; python server.py</code>
               </p>
             )}
 
