@@ -10,11 +10,13 @@ import queue
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, TYPE_CHECKING, Union, cast
+from urllib.parse import urlparse
 
 from azure.core.credentials import AzureKeyCredential
 from azure.core.credentials_async import AsyncTokenCredential
-from azure.identity.aio import AzureCliCredential
+from azure.identity.aio import DefaultAzureCredential
 from azure.ai.voicelive.aio import AgentSessionConfig, connect
 from azure.ai.voicelive.models import (
     AvatarConfig,
@@ -35,9 +37,14 @@ from azure.ai.voicelive.models import (
 )
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-import pyaudio
 import uvicorn
+
+try:
+    import pyaudio
+except Exception:
+    pyaudio = None
 
 if TYPE_CHECKING:
     from azure.ai.voicelive.aio import VoiceLiveConnection
@@ -94,6 +101,26 @@ ALLOWED_ORIGINS = {
 }
 
 VOICE_SHORT_NAME_SUFFIX = "Neural"
+SERVER_HOST = os.environ.get("SERVER_HOST", "127.0.0.1")
+SERVER_PORT = int(os.environ.get("PORT", os.environ.get("SERVER_PORT", "8765")))
+FRONTEND_DIST_DIR = Path(SCRIPT_DIR).parent / "dist"
+LOCAL_AUDIO_ENABLED = os.environ.get("VOICE_ENABLE_LOCAL_AUDIO", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _is_allowed_websocket_origin(origin: str, request_host: str) -> bool:
+    if not origin:
+        return True
+
+    if origin in ALLOWED_ORIGINS:
+        return True
+
+    parsed_origin = urlparse(origin)
+    return bool(parsed_origin.scheme and parsed_origin.netloc and parsed_origin.netloc == request_host)
 
 
 def build_agent_config() -> AgentSessionConfig:
@@ -184,7 +211,8 @@ async def health() -> dict[str, str]:
 @app.websocket("/ws")
 async def voice_endpoint(websocket: WebSocket) -> None:
     origin = websocket.headers.get("origin", "")
-    if origin and origin not in ALLOWED_ORIGINS:
+    request_host = websocket.headers.get("host", "")
+    if not _is_allowed_websocket_origin(origin, request_host):
         await websocket.close(code=1008, reason="Origin not allowed")
         return
 
@@ -204,6 +232,20 @@ async def voice_endpoint(websocket: WebSocket) -> None:
             pass
     finally:
         await session.cleanup()
+
+
+@app.get("/{full_path:path}")
+async def spa_entry(full_path: str) -> FileResponse:
+    candidate = (FRONTEND_DIST_DIR / full_path).resolve()
+
+    if FRONTEND_DIST_DIR.exists() and candidate.is_file() and FRONTEND_DIST_DIR in candidate.parents:
+        return FileResponse(candidate)
+
+    index_file = FRONTEND_DIST_DIR / "index.html"
+    if index_file.is_file():
+        return FileResponse(index_file)
+
+    raise RuntimeError("Frontend build output was not found. Run `npm run build` before starting the app.")
 
 
 class VoiceSession:
@@ -271,7 +313,9 @@ class VoiceSession:
                 "Set AZURE_VOICELIVE_ENDPOINT, AZURE_VOICELIVE_AGENT_ID, and AZURE_VOICELIVE_PROJECT_NAME in luiseagent/.env"
             )
 
-        credential: Union[AzureKeyCredential, AsyncTokenCredential] = AzureCliCredential()
+        credential: Union[AzureKeyCredential, AsyncTokenCredential] = DefaultAzureCredential(
+            exclude_interactive_browser_credential=False
+        )
 
         async with connect(
             endpoint=ENDPOINT,
@@ -536,8 +580,8 @@ class AudioProc:
 
     def __init__(self, conn: VoiceLiveConnection) -> None:
         self.conn = conn
-        self.pa = pyaudio.PyAudio()
-        self.fmt = pyaudio.paInt16
+        self.pa = pyaudio.PyAudio() if LOCAL_AUDIO_ENABLED and pyaudio is not None else None
+        self.fmt = pyaudio.paInt16 if self.pa is not None and pyaudio is not None else None
         self.ch = 1
         self.rate = 24000
         self.chunk = 1200
@@ -555,6 +599,9 @@ class AudioProc:
         return time.monotonic() < (self._duck_capture_until + max(grace_seconds, 0.0))
 
     def start_capture(self) -> None:
+        if self.pa is None or self.fmt is None:
+            return
+
         if self.input_stream:
             return
         self.loop = asyncio.get_event_loop()
@@ -597,10 +644,19 @@ class AudioProc:
             self.output_stream.stop_stream()
             self.output_stream.close()
             self.output_stream = None
-        self.pa.terminate()
+        if self.pa is not None:
+            self.pa.terminate()
 
 
 def _check_audio_devices() -> None:
+    if not LOCAL_AUDIO_ENABLED:
+        logger.info("Backend local audio is disabled; browser media devices will be used instead")
+        return
+
+    if pyaudio is None:
+        logger.warning("PyAudio is not available; backend local audio checks are skipped")
+        return
+
     p = pyaudio.PyAudio()
     try:
         def _has_channels(key: str) -> bool:
@@ -621,9 +677,9 @@ if __name__ == "__main__":
     _check_audio_devices()
     print("Foundry Voice Agent Server")
     print("=" * 40)
-    print("WebSocket : ws://127.0.0.1:8765/ws")
-    print("Health    : http://127.0.0.1:8765/health")
+    print(f"WebSocket : ws://{SERVER_HOST}:{SERVER_PORT}/ws")
+    print(f"Health    : http://{SERVER_HOST}:{SERVER_PORT}/health")
     print("Logs      : luiseagent/logs/")
     print("Press Ctrl+C to stop")
     print()
-    uvicorn.run(app, host="127.0.0.1", port=8765, log_level="warning")
+    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT, log_level="warning")

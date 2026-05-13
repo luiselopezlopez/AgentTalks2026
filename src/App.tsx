@@ -5,6 +5,11 @@ interface ChatMsg { id: number; role: 'user' | 'assistant'; text: string }
 
 const TARGET_SAMPLE_RATE = 24000
 
+const resolveWebSocketUrl = () => {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${window.location.host}/ws`
+}
+
 const STATUS_LABEL: Record<VoiceStatus, string> = {
   idle:        'Initializing avatar…',
   connecting:  'Connecting to voice AI…',
@@ -303,7 +308,7 @@ function App() {
     setAvatarNotice(null)
     setMessages([])
 
-    const ws = new WebSocket('ws://127.0.0.1:8765/ws')
+    const ws = new WebSocket(resolveWebSocketUrl())
     wsRef.current = ws
 
     ws.onmessage = (ev) => {
