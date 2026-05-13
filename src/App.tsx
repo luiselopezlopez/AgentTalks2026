@@ -11,14 +11,14 @@ const resolveWebSocketUrl = () => {
 }
 
 const STATUS_LABEL: Record<VoiceStatus, string> = {
-  idle:        'Initializing avatar…',
-  connecting:  'Connecting to voice AI…',
-  connected:   'Voice AI connected',
-  ready:       'Ready — speak now',
-  listening:   'Listening…',
-  processing:  'Thinking…',
-  speaking:    'Speaking…',
-  error:       'Connection error — reload to retry',
+  idle:        'Inicializando avatar…',
+  connecting:  'Conectando con Mar IA Jose…',
+  connected:   'Mar IA Jose conectada',
+  ready:       'Lista para hablar',
+  listening:   'Escuchando…',
+  processing:  'Pensando…',
+  speaking:    'Hablando…',
+  error:       'Error de conexión — recarga para reintentar',
 }
 
 function App() {
@@ -258,7 +258,7 @@ function App() {
       if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
         setAvatarReady(false)
         avatarReadyRef.current = false
-        setAvatarNotice('Avatar stream could not be established. Audio will continue without video.')
+        setAvatarNotice('No se pudo establecer el video del avatar. El audio continuará sin video.')
       }
     }
 
@@ -328,7 +328,7 @@ function App() {
       } else if (msg.type === 'avatar_connecting') {
         setAvatarReady(false)
         avatarReadyRef.current = false
-        setAvatarNotice('Connecting avatar stream…')
+        setAvatarNotice('Conectando el video del avatar…')
       } else if (msg.type === 'avatar_answer') {
         const payload = JSON.parse(atob(msg.sdp as string)) as RTCSessionDescriptionInit
         if (pcRef.current) {
@@ -341,7 +341,7 @@ function App() {
       } else if (msg.type === 'avatar_error') {
         setAvatarReady(false)
         avatarReadyRef.current = false
-        setAvatarNotice((msg.message as string | undefined) ?? 'Avatar is not available for this session. Audio will continue without video.')
+        setAvatarNotice((msg.message as string | undefined) ?? 'El avatar no está disponible en esta sesión. El audio continuará sin video.')
       } else if (msg.type === 'audio_chunk') {
         void playRemoteAudioChunk(msg.audio as string, Number(msg.sampleRate ?? TARGET_SAMPLE_RATE))
       } else if (msg.type === 'audio_done') {
@@ -399,10 +399,10 @@ function App() {
       <main className="app-frame app-frame--avatar-mode">
         <section className="avatar-page-shell">
           <div className="avatar-page-copy">
-            <p className="eyebrow">Voice companion</p>
-            <h1>Talk to your AI companion</h1>
+            <p className="eyebrow">Mar IA Jose</p>
+            <h1>Habla con Mar IA Jose</h1>
             <p className="hero-text">
-              The session starts automatically. Talk naturally about everyday topics, technology, ideas, projects, or documentation.
+              La sesión comienza automáticamente. Habla con naturalidad sobre temas cotidianos, tecnología, ideas, proyectos o documentación.
             </p>
           </div>
         </section>
@@ -410,11 +410,11 @@ function App() {
 
       {/* ── Voice chat drawer ── */}
       {voiceOpen && (
-        <div className={voicePanelClassName} role="dialog" aria-label="Voice companion">
+        <div className={voicePanelClassName} role="dialog" aria-label="Mar IA Jose">
           <div className="voice-drawer-head">
             <span className={`voice-orb voice-orb--${voiceStatus}`} aria-hidden="true" />
             <div className="voice-drawer-headings">
-              <p className="voice-drawer-title">AI Companion</p>
+              <p className="voice-drawer-title">Mar IA Jose</p>
               <p className="voice-drawer-status">{STATUS_LABEL[voiceStatus]}</p>
             </div>
           </div>
@@ -423,11 +423,11 @@ function App() {
             <video ref={videoRef} className="avatar-video" autoPlay playsInline />
             <audio ref={audioRef} autoPlay />
             {!avatarReady && (
-              <p className="avatar-loading">{avatarNotice ?? 'Connecting avatar stream…'}</p>
+              <p className="avatar-loading">{avatarNotice ?? 'Conectando el video del avatar…'}</p>
             )}
             {mediaActivationRequired && (
               <button className="avatar-activation" type="button" onClick={() => void resumeMediaPlayback()}>
-                Tap to enable avatar audio and video
+                Toca para activar el audio y el video del avatar
               </button>
             )}
           </div>
@@ -436,16 +436,16 @@ function App() {
             {messages.length === 0 && (
               <p className="voice-hint">
                 {voiceStatus === 'connecting' || voiceStatus === 'connected'
-                  ? 'Starting your AI companion…'
+                  ? 'Iniciando Mar IA Jose…'
                   : voiceStatus === 'error'
                   ? undefined
-                  : 'Say hello, ask a question, or explore an idea.'}
+                  : 'Saluda, haz una pregunta o explora una idea.'}
               </p>
             )}
 
             {voiceStatus === 'error' && (
               <p className="voice-hint voice-hint--error">
-                Could not connect to the voice server. Make sure the Foundry agent server is running:
+                No se pudo conectar con el servidor de voz. Asegúrate de que el servidor del agente de Foundry esté en ejecución:
                 <code>cd luiseagent &amp;&amp; python server.py</code>
               </p>
             )}
