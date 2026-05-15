@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import difflib
+import html
 import json
 import logging
 import os
 import queue
+import re
 import sys
 import time
 from datetime import datetime
@@ -91,6 +93,45 @@ ALLOWED_ORIGINS = {
 }
 
 VOICE_SHORT_NAME_SUFFIX = "Neural"
+
+
+def _markdown_to_safe_html(text: str) -> str:
+    safe = html.escape(text or "", quote=True)
+    safe = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
+        r'<a href="\2" target="_blank" rel="noopener noreferrer">\1</a>',
+        safe,
+    )
+    safe = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", safe)
+    safe = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", safe)
+    safe = re.sub(r"`([^`]+)`", r"<code>\1</code>", safe)
+
+    lines = [line.strip() for line in safe.splitlines()]
+    blocks: list[str] = []
+    in_list = False
+    for line in lines:
+        if not line:
+            if in_list:
+                blocks.append("</ul>")
+                in_list = False
+            continue
+
+        if line.startswith("- ") or line.startswith("* "):
+            if not in_list:
+                blocks.append("<ul>")
+                in_list = True
+            blocks.append(f"<li>{line[2:].strip()}</li>")
+            continue
+
+        if in_list:
+            blocks.append("</ul>")
+            in_list = False
+        blocks.append(f"<p>{line}</p>")
+
+    if in_list:
+        blocks.append("</ul>")
+
+    return "".join(blocks) if blocks else "<p></p>"
 
 
 def build_agent_config() -> AgentSessionConfig:
@@ -476,7 +517,14 @@ class VoiceSession:
                     logger.info("Suppressed duplicate assistant transcript: %.120s", text)
                 else:
                     logger.info("Agent spoke: %.120s", text)
-                    await self._send({"type": "transcript", "role": "assistant", "text": text})
+                    await self._send(
+                        {
+                            "type": "transcript",
+                            "role": "assistant",
+                            "text": text,
+                            "html": _markdown_to_safe_html(text),
+                        }
+                    )
                     self._last_assistant_sent_norm = norm
                     self._last_assistant_sent_at = now
 
@@ -495,7 +543,14 @@ class VoiceSession:
                         logger.debug("Response cancel failed during barge-in", exc_info=True)
                     self._pending_barge_in = False
                 logger.info("User said: %.120s", transcript)
-                await self._send({"type": "transcript", "role": "user", "text": transcript})
+                await self._send(
+                    {
+                        "type": "transcript",
+                        "role": "user",
+                        "text": transcript,
+                        "html": _markdown_to_safe_html(transcript),
+                    }
+                )
 
         elif etype == ServerEventType.RESPONSE_DONE:
             self._active_response = False

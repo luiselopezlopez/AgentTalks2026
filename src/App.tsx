@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
 type VoiceStatus = 'idle' | 'connecting' | 'connected' | 'ready' | 'listening' | 'processing' | 'speaking' | 'error'
-interface ChatMsg { id: number; role: 'user' | 'assistant'; text: string }
+interface ChatMsg { id: number; role: 'user' | 'assistant'; text: string; html?: string }
 
 const TARGET_SAMPLE_RATE = 24000
 
@@ -346,7 +346,12 @@ function App() {
       } else if (msg.type === 'transcript') {
         setMessages((prev) => [
           ...prev,
-          { id: Date.now() + Math.random(), role: msg.role as 'user' | 'assistant', text: msg.text },
+          {
+            id: Date.now() + Math.random(),
+            role: msg.role as 'user' | 'assistant',
+            text: msg.text,
+            html: typeof msg.html === 'string' ? msg.html : undefined,
+          },
         ])
       } else if (msg.type === 'error') {
         setVoiceStatus('error')
@@ -447,7 +452,7 @@ function App() {
 
             {messages.map((msg) => (
               <div key={msg.id} className={`voice-bubble-item voice-bubble-item--${msg.role}`}>
-                {msg.text}
+                {msg.html ? <span dangerouslySetInnerHTML={{ __html: msg.html }} /> : msg.text}
               </div>
             ))}
           </div>

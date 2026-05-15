@@ -127,6 +127,45 @@ PRIVATE_NETWORKS = (
 VOICE_SHORT_NAME_PATTERN = re.compile(r"^[a-z]{2,3}-[A-Z]{2}-[A-Za-z][A-Za-z0-9]+$")
 
 
+def _markdown_to_safe_html(text: str) -> str:
+    safe = html.escape(text or "", quote=True)
+    safe = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
+        r'<a href="\2" target="_blank" rel="noopener noreferrer">\1</a>',
+        safe,
+    )
+    safe = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", safe)
+    safe = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", safe)
+    safe = re.sub(r"`([^`]+)`", r"<code>\1</code>", safe)
+
+    lines = [line.strip() for line in safe.splitlines()]
+    blocks: list[str] = []
+    in_list = False
+    for line in lines:
+        if not line:
+            if in_list:
+                blocks.append("</ul>")
+                in_list = False
+            continue
+
+        if line.startswith("- ") or line.startswith("* "):
+            if not in_list:
+                blocks.append("<ul>")
+                in_list = True
+            blocks.append(f"<li>{line[2:].strip()}</li>")
+            continue
+
+        if in_list:
+            blocks.append("</ul>")
+            in_list = False
+        blocks.append(f"<p>{line}</p>")
+
+    if in_list:
+        blocks.append("</ul>")
+
+    return "".join(blocks) if blocks else "<p></p>"
+
+
 def build_voice_config(voice_name: str) -> Union[AzureStandardVoice, str]:
     normalized_voice = voice_name.strip()
     if not normalized_voice:
@@ -737,7 +776,14 @@ class VoiceSession:
             ap.duck_capture(MIC_DUCK_POST_RESPONSE + 0.8)
             if text:
                 logger.info("AI spoke: %.120s", text)
-                await self._send({"type": "transcript", "role": "assistant", "text": text})
+                await self._send(
+                    {
+                        "type": "transcript",
+                        "role": "assistant",
+                        "text": text,
+                        "html": _markdown_to_safe_html(text),
+                    }
+                )
 
         elif etype == ServerEventType.RESPONSE_FUNCTION_CALL_ARGUMENTS_DONE:
             func_name = getattr(event, "name", "")
@@ -823,7 +869,14 @@ class VoiceSession:
                         pass
                     self._pending_barge_in = False
                 logger.info("User said: %.120s", transcript)
-                await self._send({"type": "transcript", "role": "user", "text": transcript})
+                await self._send(
+                    {
+                        "type": "transcript",
+                        "role": "user",
+                        "text": transcript,
+                        "html": _markdown_to_safe_html(transcript),
+                    }
+                )
 
         elif etype == ServerEventType.RESPONSE_DONE:
             self._active_response = False
