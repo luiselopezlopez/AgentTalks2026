@@ -1,0 +1,11 @@
+.git
+.github
+dist
+node_modules
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.env
+**/logs
+voice

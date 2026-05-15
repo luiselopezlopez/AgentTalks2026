@@ -1,0 +1,11 @@
+HTTP/1.1 200 OK
+Content-Length: 593
+Content-Type: text/html; charset=utf-8
+Date: Wed, 13 May 2026 18:35:31 GMT
+Server: uvicorn
+Accept-Ranges: bytes
+ETag: "03c3f7670f5c8291cf02ae25f01d6e1a"
+Last-Modified: Wed, 13 May 2026 17:33:14 GMT
+Set-Cookie: ARRAffinity=2d174a675073b04c10860aed8bc9c85d3c0490d7a18f148eaba7e8c0e62eca31;Path=/;HttpOnly;Secure;Domain=agenttalks2026-li3-d8fd5c.azurewebsites.net
+Set-Cookie: ARRAffinitySameSite=2d174a675073b04c10860aed8bc9c85d3c0490d7a18f148eaba7e8c0e62eca31;Path=/;HttpOnly;SameSite=None;Secure;Domain=agenttalks2026-li3-d8fd5c.azurewebsites.net
+
