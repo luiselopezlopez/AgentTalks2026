@@ -25,13 +25,11 @@ from azure.ai.voicelive.models import (
     AzureStandardVoice,
     AzureSemanticVadMultilingual,
     InputAudioFormat,
-    LlmInterimResponseConfig,
     Modality,
     OutputAudioFormat,
     RequestSession,
     ServerEventType,
     ServerVad,
-    InterimResponseTrigger,
 )
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -69,7 +67,6 @@ TRANSCRIPTION_MODEL = os.environ.get("AZURE_VOICELIVE_TRANSCRIPTION_MODEL", "azu
 AVATAR_CHARACTER = os.environ.get("AZURE_AVATAR_CHARACTER", "layla")
 AVATAR_MODEL = os.environ.get("AZURE_AVATAR_MODEL", "vasa-1")
 AGENT_NAME = os.environ.get("AZURE_VOICELIVE_AGENT_ID", "AgentTalks2026")
-AGENT_VERSION = os.environ.get("AZURE_VOICELIVE_AGENT_VERSION","14")
 PROJECT_NAME = os.environ.get("AZURE_VOICELIVE_PROJECT_NAME", "AgentTalks2026")
 CONVERSATION_ID = os.environ.get("AZURE_VOICELIVE_CONVERSATION_ID")
 FOUNDRY_RESOURCE_OVERRIDE = os.environ.get("AZURE_VOICELIVE_FOUNDRY_RESOURCE_OVERRIDE")
@@ -97,9 +94,8 @@ VOICE_SHORT_NAME_SUFFIX = "Neural"
 
 
 def build_agent_config() -> AgentSessionConfig:
-    return {
+    cfg: AgentSessionConfig = {
         "agent_name": AGENT_NAME,
-        "agent_version": AGENT_VERSION if AGENT_VERSION else None,
         "project_name": PROJECT_NAME,
         "conversation_id": CONVERSATION_ID if CONVERSATION_ID else None,
         "foundry_resource_override": FOUNDRY_RESOURCE_OVERRIDE if FOUNDRY_RESOURCE_OVERRIDE else None,
@@ -107,6 +103,9 @@ def build_agent_config() -> AgentSessionConfig:
             AUTH_IDENTITY_CLIENT_ID if AUTH_IDENTITY_CLIENT_ID and FOUNDRY_RESOURCE_OVERRIDE else None
         ),
     }
+    # Do not pin agent version so Voice Live resolves the latest published one.
+    cfg.pop("agent_version", None)
+    return cfg
 
 
 def build_voice_config(voice_name: str) -> Union[AzureStandardVoice, str]:
@@ -128,20 +127,10 @@ def _build_session_request(include_avatar: bool, include_voice: bool = True) -> 
     if include_avatar:
         modalities.append(Modality.AVATAR)
 
-    interim_response_config = LlmInterimResponseConfig(
-        triggers=[InterimResponseTrigger.TOOL, InterimResponseTrigger.LATENCY],
-        latency_threshold_ms=100,
-        instructions=(
-            "Create friendly interim responses indicating wait time due to ongoing processing, if any. "
-            "Do not include them in all responses. Do not say you lack real-time access when calling tools."
-        ),
-    )
-
     kwargs = {
         "modalities": modalities,
         "input_audio_format": InputAudioFormat.PCM16,
         "output_audio_format": OutputAudioFormat.PCM16,
-        "interim_response": interim_response_config,
         "turn_detection": ServerVad(
             threshold=VAD_THRESHOLD,
             prefix_padding_ms=VAD_PREFIX_PADDING_MS,
@@ -218,6 +207,8 @@ class VoiceSession:
         self._last_spoken_chars = 0
         self._last_assistant_text = ""
         self._last_assistant_spoke_at = 0.0
+        self._last_assistant_sent_norm = ""
+        self._last_assistant_sent_at = 0.0
         self._pending_barge_in = False
         self._avatar_answer_event = asyncio.Event()
         self._avatar_server_sdp: Optional[str] = None
@@ -479,8 +470,15 @@ class VoiceSession:
             self._audio_transcript_acc = ""
             ap.duck_capture(MIC_DUCK_POST_RESPONSE + 0.8)
             if text:
-                logger.info("Agent spoke: %.120s", text)
-                await self._send({"type": "transcript", "role": "assistant", "text": text})
+                norm = self._norm_text(text)
+                now = time.monotonic()
+                if norm and norm == self._last_assistant_sent_norm and (now - self._last_assistant_sent_at) < 2.0:
+                    logger.info("Suppressed duplicate assistant transcript: %.120s", text)
+                else:
+                    logger.info("Agent spoke: %.120s", text)
+                    await self._send({"type": "transcript", "role": "assistant", "text": text})
+                    self._last_assistant_sent_norm = norm
+                    self._last_assistant_sent_at = now
 
         elif etype == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
             transcript = getattr(event, "transcript", "")

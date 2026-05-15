@@ -22,8 +22,6 @@ from azure.ai.voicelive.models import (
     ServerEventType,
     MessageItem,
     InputTextContentPart,
-    LlmInterimResponseConfig,
-    InterimResponseTrigger,
     AzureStandardVoice,
     AudioNoiseReduction,
     AudioEchoCancellation,
@@ -262,12 +260,13 @@ class BasicVoiceAssistant:
         # Build AgentSessionConfig internally
         self.agent_config: AgentSessionConfig = {
             "agent_name": agent_name,
-            "agent_version": agent_version if agent_version else None,
             "project_name": project_name,
             "conversation_id": conversation_id if conversation_id else None,
             "foundry_resource_override": foundry_resource_override if foundry_resource_override else None, 
             "authentication_identity_client_id": agent_authentication_identity_client_id if agent_authentication_identity_client_id and foundry_resource_override else None,                
-        }        
+        }
+        # Do not pin agent version so Voice Live resolves the latest published one.
+        self.agent_config.pop("agent_version", None)
 
         self.connection: Optional["VoiceLiveConnection"] = None
         self.audio_processor: Optional[AudioProcessor] = None
@@ -275,6 +274,23 @@ class BasicVoiceAssistant:
         self.greeting_sent = False
         self._active_response = False
         self._response_api_done = False
+        self._last_assistant_output_norm = ""
+        self._last_assistant_output_at = 0.0
+
+    @staticmethod
+    def _norm_text(text: str) -> str:
+        compact = " ".join(text.lower().split())
+        return "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in compact).strip()
+
+    def _should_emit_assistant_output(self, text: str) -> bool:
+        norm = self._norm_text(text)
+        now = asyncio.get_running_loop().time()
+        is_duplicate = bool(norm) and norm == self._last_assistant_output_norm and (now - self._last_assistant_output_at) < 2.0
+        if is_duplicate:
+            return False
+        self._last_assistant_output_norm = norm
+        self._last_assistant_output_at = now
+        return True
 
     async def start(self) -> None:
         """Start the voice assistant session."""
@@ -326,20 +342,11 @@ class BasicVoiceAssistant:
         """Configure the VoiceLive session for audio conversation."""
         logger.info("Setting up voice conversation session...")
 
-        # Set up interim response configuration to bridge latency gaps during processing
-        interim_response_config = LlmInterimResponseConfig(
-            triggers=[InterimResponseTrigger.TOOL, InterimResponseTrigger.LATENCY],
-            latency_threshold_ms=100,
-            instructions="""Create friendly interim responses indicating wait time due to ongoing processing, if any. Do not include
-                            in all responses! Do not say you don't have real-time access to information when calling tools!"""
-        )
-
         # Create session configuration
         session_config = RequestSession(
             modalities=[Modality.TEXT, Modality.AUDIO],
             input_audio_format=InputAudioFormat.PCM16,
             output_audio_format=OutputAudioFormat.PCM16,
-            interim_response=interim_response_config,
             # Uncomment the following, if not stored with agent configuration on the service side
             # voice=AzureStandardVoice(name=self.voice),
             # turn_detection=AzureSemanticVadMultilingual(),
@@ -412,12 +419,20 @@ class BasicVoiceAssistant:
             await write_conversation_log(f'User Input:\t{event.get("transcript", "")}')
 
         elif event.type == ServerEventType.RESPONSE_TEXT_DONE:
-            print(f'🤖 Agent responded with text:\t{event.get("text", "")}')
-            await write_conversation_log(f'Agent Text Response:\t{event.get("text", "")}')
+            text = event.get("text", "")
+            if self._should_emit_assistant_output(text):
+                print(f'🤖 Agent responded with text:\t{text}')
+                await write_conversation_log(f'Agent Text Response:\t{text}')
+            else:
+                logger.info("Suppressed duplicate assistant text response")
 
         elif event.type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE:
-            print(f'🤖 Agent responded with audio transcript:\t{event.get("transcript", "")}')
-            await write_conversation_log(f'Agent Audio Response:\t{event.get("transcript", "")}')
+            transcript = event.get("transcript", "")
+            if self._should_emit_assistant_output(transcript):
+                print(f'🤖 Agent responded with audio transcript:\t{transcript}')
+                await write_conversation_log(f'Agent Audio Response:\t{transcript}')
+            else:
+                logger.info("Suppressed duplicate assistant audio transcript")
 
         elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
             logger.info("User started speaking - stopping playback")
@@ -484,7 +499,7 @@ def main() -> None:
     endpoint = os.environ.get("AZURE_VOICELIVE_ENDPOINT", "https://agenttalks2026.services.ai.azure.com/")
     #voice_name = os.environ.get("AZURE_VOICELIVE_VOICE", "en-US-Ava:DragonHDLatestNeural")
     agent_name = os.environ.get("AZURE_VOICELIVE_AGENT_ID", "AgentTalks2026")
-    agent_version = os.environ.get("AZURE_VOICELIVE_AGENT_VERSION", "15")
+    agent_version = None
     project_name = os.environ.get("AZURE_VOICELIVE_PROJECT_NAME", "AgentTalks2026")
     conversation_id = os.environ.get("AZURE_VOICELIVE_CONVERSATION_ID")
     foundry_resource_override = os.environ.get("AZURE_VOICELIVE_FOUNDRY_RESOURCE_OVERRIDE")
@@ -494,7 +509,7 @@ def main() -> None:
     print(f"AZURE_VOICELIVE_ENDPOINT: {endpoint}")
     #print(f"AZURE_VOICELIVE_VOICE: {voice_name}")
     print(f"AZURE_VOICELIVE_AGENT_ID: {agent_name}")
-    print(f"AZURE_VOICELIVE_AGENT_VERSION: {agent_version}")
+    print("AZURE_VOICELIVE_AGENT_VERSION: latest (auto)")
     print(f"AZURE_VOICELIVE_PROJECT_NAME: {project_name}")
     print(f"AZURE_VOICELIVE_CONVERSATION_ID: {conversation_id}")
     print(f"AZURE_VOICELIVE_FOUNDRY_RESOURCE_OVERRIDE: {foundry_resource_override}")
